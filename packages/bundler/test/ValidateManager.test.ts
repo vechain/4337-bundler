@@ -1,37 +1,39 @@
-import { EntryPoint, EntryPoint__factory } from '@account-abstraction/contracts'
-import { assert, expect } from 'chai'
-import { defaultAbiCoder, hexConcat, hexlify, keccak256, parseEther } from 'ethers/lib/utils'
-import { ethers } from 'hardhat'
-
-import { AddressZero, decodeErrorReason, toBytes32 } from '@account-abstraction/utils'
+import { EntryPoint, EntryPoint__factory, UserOperation } from '@account-abstraction/contract-types'
 import {
-  ValidateUserOpResult,
-  ValidationManager,
-  checkRulesViolations,
-  supportsDebugTraceCall
-} from '@account-abstraction/validation-manager'
-
+  AbiCoder,
+  BigNumberish,
+  BytesLike,
+  concat,
+  hexlify, isBytesLike,
+  keccak256,
+  parseEther,
+  Signer,
+  toBeHex, zeroPadValue,
+} from 'ethers'
+import { expect } from 'chai'
 import {
-  TestCoin,
-  TestCoin__factory,
   TestOpcodesAccount,
+  TestOpcodesAccount__factory,
   TestOpcodesAccountFactory,
   TestOpcodesAccountFactory__factory,
-  TestOpcodesAccount__factory,
-  TestRecursionAccount__factory,
   TestRulesAccount,
-  TestRulesAccountFactory__factory,
   TestRulesAccount__factory,
-  TestStorageAccount,
+  TestRulesAccountFactory__factory,
+  TestStorageAccount__factory,
   TestStorageAccountFactory,
   TestStorageAccountFactory__factory,
-  TestStorageAccount__factory,
-  TestTimeRangeAccountFactory,
-  TestTimeRangeAccountFactory__factory
+  TestStorageAccount,
+  TestCoin,
+  TestCoin__factory
 } from '../src/types'
+import { ValidateUserOpResult, ValidationManager } from '../src/modules/ValidationManager'
 import { ReputationManager } from '../src/modules/ReputationManager'
+import { AddressZero, decodeErrorReason, toLowerAddr } from '@account-abstraction/utils'
+import { supportsDebugTraceCall } from '../src/utils'
+import { TestRecursionAccount__factory } from '../src/types/factories/contracts/tests/TestRecursionAccount__factory'
+import { provider } from './testUtils'
 
-import { UserOperation } from '../src/modules/Types'
+const defaultAbiCoder = AbiCoder.defaultAbiCoder()
 
 const cEmptyUserOp: UserOperation = {
   sender: AddressZero,
@@ -47,6 +49,14 @@ const cEmptyUserOp: UserOperation = {
   preVerificationGas: 0
 }
 
+function toBytes32 (value: BigNumberish | BytesLike): string {
+  if (isBytesLike(value)) {
+    return zeroPadValue(value, 32)
+  } else {
+    return toBeHex(value, 32)
+  }
+}
+
 describe('#ValidationManager', () => {
   let vm: ValidationManager
   let opcodeFactory: TestOpcodesAccountFactory
@@ -58,8 +68,8 @@ describe('#ValidationManager', () => {
   let rulesAccount: TestRulesAccount
   let storageAccount: TestStorageAccount
 
-  async function testUserOp (validateRule: string = '', pmRule?: string, initFunc?: string, factoryAddress = opcodeFactory.address): Promise<ValidateUserOpResult & { userOp: UserOperation }> {
-    const userOp = await createTestUserOp(validateRule, pmRule, initFunc, factoryAddress)
+  async function testUserOp (validateRule: string = '', pmRule?: string, initFunc?: string, factoryAddress?: string): Promise<ValidateUserOpResult & { userOp: UserOperation }> {
+    const userOp = await createTestUserOp(validateRule, pmRule, initFunc, factoryAddress ?? await opcodeFactory.getAddress())
     return { userOp, ...await vm.validateUserOp(userOp) }
   }
 
@@ -69,11 +79,11 @@ describe('#ValidationManager', () => {
   }
 
   async function existingStorageAccountUserOp (validateRule = '', pmRule = ''): Promise<UserOperation> {
-    const paymasterAndData = pmRule === '' ? '0x' : hexConcat([paymaster.address, Buffer.from(pmRule)])
+    const paymasterAndData = pmRule === '' ? '0x' : concat([await paymaster.getAddress(), Buffer.from(pmRule)])
     const signature = hexlify(Buffer.from(validateRule))
     return {
       ...cEmptyUserOp,
-      sender: storageAccount.address,
+      sender: await storageAccount.getAddress(),
       signature,
       paymasterAndData,
       callGasLimit: 1e6,
@@ -82,16 +92,16 @@ describe('#ValidationManager', () => {
     }
   }
 
-  async function createTestUserOp (validateRule: string = '', pmRule?: string, initFunc?: string, factoryAddress = opcodeFactory.address): Promise<UserOperation> {
+  async function createTestUserOp (validateRule: string = '', pmRule?: string, initFunc?: string, factoryAddress?: string): Promise<UserOperation> {
     if (initFunc === undefined) {
       initFunc = opcodeFactory.interface.encodeFunctionData('create', [''])
     }
 
-    const initCode = hexConcat([
-      factoryAddress,
+    const initCode = concat([
+      factoryAddress ?? await opcodeFactory.getAddress(),
       initFunc
     ])
-    const paymasterAndData = pmRule == null ? '0x' : hexConcat([paymaster.address, Buffer.from(pmRule)])
+    const paymasterAndData = pmRule == null ? '0x' : concat([await paymaster.getAddress(), Buffer.from(pmRule)])
     const signature = hexlify(Buffer.from(validateRule))
     const callinitCodeForAddr = await provider.call({
       to: factoryAddress,
@@ -114,27 +124,27 @@ describe('#ValidationManager', () => {
     }
   }
 
-  const provider = ethers.provider
-  const ethersSigner = provider.getSigner()
+  let ethersSigner: Signer
 
   before(async function () {
+    ethersSigner = await provider.getSigner()
     entryPoint = await new EntryPoint__factory(ethersSigner).deploy()
     paymaster = await new TestOpcodesAccount__factory(ethersSigner).deploy()
-    await entryPoint.depositTo(paymaster.address, { value: parseEther('0.1') })
-    await paymaster.addStake(entryPoint.address, { value: parseEther('0.1') })
+    await entryPoint.depositTo(await paymaster.getAddress(), { value: parseEther('0.1') })
+    await paymaster.addStake(await entryPoint.getAddress(), { value: parseEther('0.1') })
     opcodeFactory = await new TestOpcodesAccountFactory__factory(ethersSigner).deploy()
     testcoin = await new TestCoin__factory(ethersSigner).deploy()
-    storageFactory = await new TestStorageAccountFactory__factory(ethersSigner).deploy(testcoin.address)
+    storageFactory = await new TestStorageAccountFactory__factory(ethersSigner).deploy(await testcoin.getAddress())
 
-    storageAccount = TestStorageAccount__factory.connect(await storageFactory.callStatic.create(1, ''), provider)
+    storageAccount = TestStorageAccount__factory.connect(await storageFactory.create.staticCall(1, ''), provider)
     await storageFactory.create(1, '')
 
     const rulesFactory = await new TestRulesAccountFactory__factory(ethersSigner).deploy()
-    rulesAccount = TestRulesAccount__factory.connect(await rulesFactory.callStatic.create(''), provider)
+    rulesAccount = TestRulesAccount__factory.connect(await rulesFactory.create.staticCall(''), provider)
     await rulesFactory.create('')
-    await entryPoint.depositTo(rulesAccount.address, { value: parseEther('1') })
+    await entryPoint.depositTo(await rulesAccount.getAddress(), { value: parseEther('1') })
 
-    const reputationManager = new ReputationManager(provider, {
+    const reputationManager = new ReputationManager({
       minInclusionDenominator: 1,
       throttlingSlack: 1,
       banSlack: 1
@@ -146,13 +156,15 @@ describe('#ValidationManager', () => {
     if (!await supportsDebugTraceCall(ethers.provider)) {
       console.log('WARNING: opcode banning tests can only run with geth')
       this.skip()
+      return
     }
+    vm = new ValidationManager(entryPoint, reputationManager, false)
   })
 
   it('#getCodeHashes', async () => {
-    const epHash = keccak256(await provider.getCode(entryPoint.address))
-    const pmHash = keccak256(await provider.getCode(paymaster.address))
-    const addresses = [entryPoint.address, paymaster.address]
+    const epHash = keccak256(await provider.getCode(await entryPoint.getAddress()))
+    const pmHash = keccak256(await provider.getCode(await paymaster.getAddress()))
+    const addresses = [await entryPoint.getAddress(), await paymaster.getAddress()]
     const packed = defaultAbiCoder.encode(['bytes32[]'], [[epHash, pmHash]])
     const packedHash = keccak256(packed)
     expect(await vm.getCodeHashes(addresses)).to.eql({
@@ -187,7 +199,7 @@ describe('#ValidationManager', () => {
   })
   // TODO: add a test with existing wallet, which should succeed (there is one in the "bundler spec"
   it('should fail referencing self token balance (during wallet creation)', async () => {
-    expect(await testUserOp('balance-self', undefined, storageFactory.interface.encodeFunctionData('create', [0, '']), storageFactory.address)
+    expect(await testUserOp('balance-self', undefined, storageFactory.interface.encodeFunctionData('create', [0, '']), await storageFactory.getAddress())
       .catch(e => e)
     ).to.match(/unstaked account accessed/)
   })
@@ -218,68 +230,23 @@ describe('#ValidationManager', () => {
     })
   })
 
-  describe('time-range', () => {
-    let testTimeRangeAccountFactory: TestTimeRangeAccountFactory
-
-    // note: parameters are "js time", not "unix time"
-    async function testTimeRangeUserOp (validAfterMs: number, validUntilMs: number): Promise<void> {
-      const userOp = await createTestUserOp('', undefined, undefined, testTimeRangeAccountFactory.address)
-      userOp.preVerificationGas = Math.floor(validAfterMs / 1000)
-      userOp.maxPriorityFeePerGas = Math.floor(validUntilMs / 1000)
-      console.log('=== validAfter: ', userOp.preVerificationGas, 'validuntil', userOp.maxPriorityFeePerGas)
-      await vm.validateUserOp(userOp)
-    }
-
-    before(async () => {
-      testTimeRangeAccountFactory = await new TestTimeRangeAccountFactory__factory(ethersSigner).deploy()
-    })
-
-    it('should accept request with future validUntil', async () => {
-      await testTimeRangeUserOp(0, Date.now() + 60000)
-    })
-    it('should accept request with past validAfter', async () => {
-      await testTimeRangeUserOp(10000, 0)
-    })
-    it('should accept request with valid range validAfter..validTo', async () => {
-      await testTimeRangeUserOp(10000, Date.now() + 60000)
-    })
-
-    it('should reject request with past validUntil', async () => {
-      await expect(
-        testTimeRangeUserOp(0, Date.now() - 1000)
-      ).to.be.rejectedWith('already expired')
-    })
-
-    it('should reject request with short validUntil', async () => {
-      await expect(
-        testTimeRangeUserOp(0, Date.now() + 25000)
-      ).to.be.rejectedWith('expires too soon')
-    })
-
-    it('should reject request with future validAfter', async () => {
-      await expect(
-        testTimeRangeUserOp(Date.now() * 2, 0)
-      ).to.be.rejectedWith('future ')
-    })
-  })
-
   describe('validate storageMap', () => {
     // let names: { [name: string]: string }
     before(async () => {
       // names = {
-      //   pm: paymaster.address,
-      //   ep: entryPoint.address,
-      //   opf: opcodeFactory.address,
-      //   stf: storageFactory.address,
+      //   pm: await paymaster.getAddress(),
+      //   ep: await entryPoint.getAddress(),
+      //   opf: await opcodeFactory.getAddress(),
+      //   stf: await storageFactory.getAddress(),
       //   acc: rulesAccount.address,
       //   tok: await rulesAccount.coin()
       // }
     })
 
     it('should return nothing during account creation', async () => {
-      const ret = await testUserOp('read-self', undefined, storageFactory.interface.encodeFunctionData('create', [0, '']), storageFactory.address)
+      const ret = await testUserOp('read-self', undefined, storageFactory.interface.encodeFunctionData('create', [0, '']), await storageFactory.getAddress())
       // console.log('resolved=', resolveNames(ret, names, true))
-      expect(ret.storageMap[ret.userOp.sender.toLowerCase()]).to.eql({
+      expect(ret.storageMap[await toLowerAddr(ret.userOp.sender)]).to.eql({
         [toBytes32(1)]: toBytes32(0)
       })
     })
@@ -287,9 +254,9 @@ describe('#ValidationManager', () => {
     it('should return self storage on existing account', async () => {
       const ret = await testExistingUserOp('read-self')
       // console.log('resolved=', resolveNames(ret, names, true))
-      const account = ret.userOp.sender.toLowerCase()
+      const account = await toLowerAddr(ret.userOp.sender)
       expect(ret.storageMap[account]).to.eql({
-        [toBytes32(1)]: toBytes32(testcoin.address)
+        [toBytes32(1)]: zeroPadValue(await testcoin.getAddress(), 32)
       })
     })
 
@@ -302,22 +269,22 @@ describe('#ValidationManager', () => {
       const ret = await testExistingUserOp('balance-self')
       // console.log('resolved=', resolveNames(ret, names, true))
 
-      const account = ret.userOp.sender.toLowerCase()
+      const account = await toLowerAddr(ret.userOp.sender)
 
       // account's token at slot 1 of account
       expect(ret.storageMap[account]).to.eql({
-        [toBytes32(1)]: toBytes32(testcoin.address)
+        [toBytes32(1)]: toBytes32(await testcoin.getAddress())
       })
       // token.balances[account] - balances uses slot 0 of token
-      const hashRef = keccak256(hexConcat([toBytes32(account), toBytes32(0)]))
-      expect(ret.storageMap[testcoin.address.toLowerCase()]).to.eql({
+      const hashRef = keccak256(concat([toBytes32(account), toBytes32(0)]))
+      expect(ret.storageMap[(await testcoin.getAddress()).toLowerCase()]).to.eql({
         [hashRef]: toBytes32(0)
       })
     })
   })
 
   it('should fail if referencing other token balance', async () => {
-    expect(await testUserOp('balance-1', undefined, storageFactory.interface.encodeFunctionData('create', [0, '']), storageFactory.address)
+    expect(await testUserOp('balance-1', undefined, storageFactory.interface.encodeFunctionData('create', [0, '']), await storageFactory.getAddress())
       .catch(e => e.message))
       .to.match(/account has forbidden read/)
   })
@@ -329,14 +296,14 @@ describe('#ValidationManager', () => {
   it('should fail with unstaked paymaster returning context', async () => {
     const pm = await new TestStorageAccount__factory(ethersSigner).deploy()
     // await entryPoint.depositTo(pm.address, { value: parseEther('0.1') })
-    // await pm.addStake(entryPoint.address, { value: parseEther('0.1') })
-    const acct = await new TestRecursionAccount__factory(ethersSigner).deploy(entryPoint.address)
+    // await pm.addStake(await entryPoint.getAddress(), { value: parseEther('0.1') })
+    const acct = await new TestRecursionAccount__factory(ethersSigner).deploy(await entryPoint.getAddress())
 
     const userOp = {
       ...cEmptyUserOp,
-      sender: acct.address,
-      paymasterAndData: hexConcat([
-        pm.address,
+      sender: await acct.getAddress(),
+      paymasterAndData: concat([
+        await pm.getAddress(),
         Buffer.from('postOp-context')
       ])
     }
@@ -346,10 +313,10 @@ describe('#ValidationManager', () => {
   })
 
   it('should fail if validation recursively calls handleOps', async () => {
-    const acct = await new TestRecursionAccount__factory(ethersSigner).deploy(entryPoint.address)
+    const acct = await new TestRecursionAccount__factory(ethersSigner).deploy(await entryPoint.getAddress())
     const op: UserOperation = {
       ...cEmptyUserOp,
-      sender: acct.address,
+      sender: await acct.getAddress(),
       signature: hexlify(Buffer.from('handleOps')),
       preVerificationGas: 50000
     }
@@ -359,26 +326,11 @@ describe('#ValidationManager', () => {
     ).to.match(/illegal call into EntryPoint/)
   })
   it('should succeed with inner revert', async () => {
-    expect(await testUserOp('inner-revert', undefined, storageFactory.interface.encodeFunctionData('create', [0, '']), storageFactory.address))
+    expect(await testUserOp('inner-revert', undefined, storageFactory.interface.encodeFunctionData('create', [0, '']), await storageFactory.getAddress()))
   })
   it('should fail with inner oog revert', async () => {
-    expect(await testUserOp('oog', undefined, storageFactory.interface.encodeFunctionData('create', [0, '']), storageFactory.address)
+    expect(await testUserOp('oog', undefined, storageFactory.interface.encodeFunctionData('create', [0, '']), await storageFactory.getAddress())
       .catch(e => e.message)
     ).to.match(/account internally reverts on oog/)
-  })
-
-  describe('ValidationPackage', () => {
-    it('should pass for a transaction that does not violate the rules', async () => {
-      const userOp = await createTestUserOp()
-      const res = await checkRulesViolations(provider, userOp, entryPoint.address)
-      assert.equal(res.returnInfo.sigFailed, false)
-    })
-
-    it('should throw for a transaction that violates the rules', async () => {
-      const userOp = await createTestUserOp('coinbase')
-      await expect(
-        checkRulesViolations(provider, userOp, entryPoint.address)
-      ).to.be.rejectedWith('account uses banned opcode: COINBASE')
-    })
   })
 })

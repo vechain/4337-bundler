@@ -1,28 +1,19 @@
 import fs from 'fs'
 
 import { Command } from 'commander'
-import { erc4337RuntimeVersion, RpcError, supportsRpcMethod } from '@account-abstraction/utils'
-import { ethers, Wallet, Signer } from 'ethers'
+import { erc4337RuntimeVersion } from '@account-abstraction/utils'
+import { HDNodeWallet, toNumber, parseEther, JsonRpcProvider, Signer, ethers } from 'ethers'
 
 import { BundlerServer } from './BundlerServer'
 import { UserOpMethodHandler } from './UserOpMethodHandler'
-import { EntryPoint, EntryPoint__factory } from '@account-abstraction/contracts'
+import { EntryPoint, EntryPoint__factory } from '@account-abstraction/contract-types'
 
 import { initServer } from './modules/initServer'
 import { DebugMethodHandler } from './DebugMethodHandler'
 import { DeterministicDeployer } from '@account-abstraction/sdk'
-import { supportsDebugTraceCall } from '@account-abstraction/validation-manager'
+import { supportsDebugTraceCall, supportsRpcMethod } from './utils'
 import { resolveConfiguration } from './Config'
 import { bundlerConfigDefault } from './BundlerConfig'
-import { JsonRpcProvider } from '@ethersproject/providers'
-import { parseEther } from 'ethers/lib/utils'
-
-// this is done so that console.log outputs BigNumber as hex string instead of unreadable object
-export const inspectCustomSymbol = Symbol.for('nodejs.util.inspect.custom')
-// @ts-ignore
-ethers.BigNumber.prototype[inspectCustomSymbol] = function () {
-  return `BigNumber ${parseInt(this._hex)}`
-}
 
 const CONFIG_FILE_NAME = 'workdir/bundler.config.json'
 
@@ -70,7 +61,6 @@ export async function runBundler (argv: string[], overrideExit = true): Promise<
     .option('--config <string>', 'path to config file', CONFIG_FILE_NAME)
     .option('--auto', 'automatic bundling (bypass config.autoBundleMempoolSize)', false)
     .option('--unsafe', 'UNSAFE mode: no storage or opcode checks (safe mode requires geth)')
-    .option('--debugRpc', 'enable debug rpc methods (auto-enabled for test node')
     .option('--conditionalRpc', 'Use eth_sendRawTransactionConditional RPC)')
     .option('--show-stack-traces', 'Show stack traces.')
     .option('--createMnemonic <file>', 'create the mnemonic file')
@@ -86,34 +76,44 @@ export async function runBundler (argv: string[], overrideExit = true): Promise<
     if (fs.existsSync(mnemonicFile)) {
       throw new Error(`Can't --createMnemonic: out file ${mnemonicFile} already exists`)
     }
-    const newMnemonic = Wallet.createRandom().mnemonic.phrase
-    fs.writeFileSync(mnemonicFile, newMnemonic)
+    const newMnemonic = HDNodeWallet.createRandom().mnemonic?.phrase
+    fs.writeFileSync(mnemonicFile, newMnemonic ?? '')
     console.log('created mnemonic file', mnemonicFile)
     process.exit(1)
   }
-  const { config, provider, wallet } = await resolveConfiguration(programOpts)
-
   const {
-    // name: chainName,
-    chainId
-  } = await provider.getNetwork()
+    config,
+    provider,
+    wallet
+  } = await resolveConfiguration(programOpts)
 
-  if (chainId === 31337 || chainId === 1337) {
-    if (config.debugRpc == null) {
-      console.log('== debugrpc was', config.debugRpc)
-      config.debugRpc = true
-    } else {
-      console.log('== debugrpc already st', config.debugRpc)
-    }
-    await new DeterministicDeployer(provider as any).deterministicDeploy(EntryPoint__factory.bytecode)
-    if ((await wallet.getBalance()).eq(0)) {
-      console.log('=== testnet: fund signer')
-      const signer = (provider as JsonRpcProvider).getSigner()
-      await signer.sendTransaction({ to: await wallet.getAddress(), value: parseEther('1') })
-    }
-  }
+  
+//   provider.getNetwork = async function() {
+//     const chainId = await (this as JsonRpcProvider).send("eth_chainId", []);
+//     const hexChainId = chainId.toString(16);
+//     const smallChainId = '0x' + hexChainId.substring(hexChainId.length - 2);
+//     return new ethers.Network("", smallChainId);
+// };
 
-  if (config.conditionalRpc && !await supportsRpcMethod(provider as any, 'eth_sendRawTransactionConditional', [{}, {}])) {
+
+  // const {
+  //   // name: chainName,
+  //   chainId
+  // } = await provider.getNetwork()
+
+  // if (toNumber(chainId) === 31337 || toNumber(chainId) === 1337) {
+  //   await new DeterministicDeployer(provider).deterministicDeploy(EntryPoint__factory.bytecode)
+  //   if (await provider.getBalance(wallet.getAddress()) === 0n) {
+  //     console.log('=== testnet: fund signer')
+  //     const signer = await (provider as JsonRpcProvider).getSigner()
+  //     await signer.sendTransaction({
+  //       to: await wallet.getAddress(),
+  //       value: parseEther('1')
+  //     }).then(ret => ret.wait())
+  //   }
+  // }
+
+  if (config.conditionalRpc && !await supportsRpcMethod(provider as any, 'eth_sendRawTransactionConditional')) {
     console.error('FATAL: --conditionalRpc requires a node that support eth_sendRawTransactionConditional')
     process.exit(1)
   }
@@ -136,7 +136,7 @@ export async function runBundler (argv: string[], overrideExit = true): Promise<
     execManagerConfig.autoBundleInterval = 0
   }
 
-  const [execManager, eventsManager, reputationManager, mempoolManager] = initServer(execManagerConfig, entryPoint.signer)
+  const [execManager, eventsManager, reputationManager, mempoolManager] = initServer(execManagerConfig, wallet)
   const methodHandler = new UserOpMethodHandler(
     execManager,
     provider,
@@ -145,13 +145,7 @@ export async function runBundler (argv: string[], overrideExit = true): Promise<
     entryPoint
   )
   eventsManager.initEventListener()
-  const debugHandler = config.debugRpc ?? false
-    ? new DebugMethodHandler(execManager, eventsManager, reputationManager, mempoolManager)
-    : new Proxy({}, {
-      get (target: {}, method: string, receiver: any): any {
-        throw new RpcError(`method debug_bundler_${method} is not supported`, -32601)
-      }
-    }) as DebugMethodHandler
+  const debugHandler = new DebugMethodHandler(execManager, eventsManager, reputationManager, mempoolManager)
 
   const bundlerServer = new BundlerServer(
     methodHandler,

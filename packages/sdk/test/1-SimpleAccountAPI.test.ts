@@ -3,38 +3,41 @@ import {
   EntryPoint__factory,
   SimpleAccountFactory__factory,
   UserOperationStruct
-} from '@account-abstraction/contracts'
-import { Wallet } from 'ethers'
-import { parseEther } from 'ethers/lib/utils'
-import { expect } from 'chai'
+} from '@account-abstraction/contract-types'
+import { HDNodeWallet, parseEther, Signer, Wallet } from 'ethers'
 import { anyValue } from '@nomicfoundation/hardhat-chai-matchers/withArgs'
 import { ethers } from 'hardhat'
 import { DeterministicDeployer, SimpleAccountAPI } from '../src'
-import { SampleRecipient, SampleRecipient__factory, rethrowError } from '@account-abstraction/utils'
+import { AddressZero, rethrowError, SampleRecipient, SampleRecipient__factory } from '@account-abstraction/utils'
+import { expect } from 'chai'
+import '@nomicfoundation/hardhat-chai-matchers'
 
 const provider = ethers.provider
-const signer = provider.getSigner()
 
 describe('SimpleAccountAPI', () => {
-  let owner: Wallet
+  let owner: HDNodeWallet
   let api: SimpleAccountAPI
   let entryPoint: EntryPoint
   let beneficiary: string
   let recipient: SampleRecipient
   let accountAddress: string
   let accountDeployed = false
+  let signer: Signer
+  let entryPointAddress: string
 
   before('init', async () => {
+    signer = await provider.getSigner()
     entryPoint = await new EntryPoint__factory(signer).deploy()
     beneficiary = await signer.getAddress()
 
     recipient = await new SampleRecipient__factory(signer).deploy()
     owner = Wallet.createRandom()
     DeterministicDeployer.init(ethers.provider)
-    const factoryAddress = await DeterministicDeployer.deploy(new SimpleAccountFactory__factory(), 0, [entryPoint.address])
+    entryPointAddress = await entryPoint.getAddress()
+    const factoryAddress = await DeterministicDeployer.deploy(new SimpleAccountFactory__factory(), 0, [entryPointAddress])
     api = new SimpleAccountAPI({
       provider,
-      entryPointAddress: entryPoint.address,
+      entryPointAddress,
       owner,
       factoryAddress
     })
@@ -68,7 +71,7 @@ describe('SimpleAccountAPI', () => {
       value: parseEther('0.1')
     })
     const op = await api.createSignedUserOp({
-      target: recipient.address,
+      target: await recipient.getAddress(),
       data: recipient.interface.encodeFunctionData('something', ['hello'])
     })
 
@@ -82,7 +85,7 @@ describe('SimpleAccountAPI', () => {
     let userOp: UserOperationStruct
     before(async () => {
       userOp = await api.createUnsignedUserOp({
-        target: ethers.constants.AddressZero,
+        target: AddressZero,
         data: '0x'
       })
       // expect FailedOp "invalid signature length"
@@ -101,7 +104,7 @@ describe('SimpleAccountAPI', () => {
     })
     it('should parse revert with no description', async () => {
       // use wrong signature for contract..
-      const wrongContract = entryPoint.attach(recipient.address)
+      const wrongContract = EntryPoint__factory.connect(await recipient.getAddress(), signer)
       await expect(
         wrongContract.addStake(0)
       ).to.revertedWithoutReason()
@@ -114,12 +117,12 @@ describe('SimpleAccountAPI', () => {
     }
     const api1 = new SimpleAccountAPI({
       provider,
-      entryPointAddress: entryPoint.address,
+      entryPointAddress,
       accountAddress,
       owner
     })
     const op1 = await api1.createSignedUserOp({
-      target: recipient.address,
+      target: await recipient.getAddress(),
       data: recipient.interface.encodeFunctionData('something', ['world'])
     })
     await expect(entryPoint.handleOps([op1], beneficiary)).to.emit(recipient, 'Sender')

@@ -1,19 +1,26 @@
-import { EntryPoint } from '@account-abstraction/contracts'
+import { EntryPoint, UserOperation } from '@account-abstraction/contract-types'
 import { MempoolManager } from './MempoolManager'
-import { ValidateUserOpResult, ValidationManager } from '@account-abstraction/validation-manager'
-import { BigNumber, BigNumberish } from 'ethers'
-import { JsonRpcProvider, JsonRpcSigner } from '@ethersproject/providers'
+import { ValidateUserOpResult, ValidationManager } from './ValidationManager'
+import {
+  AddressLike,
+  BigNumberish,
+  ErrorDescription,
+  getBigInt,
+  Provider,
+  Signer
+} from 'ethers'
 import Debug from 'debug'
 import { ReputationManager, ReputationStatus } from './ReputationManager'
 import { Mutex } from 'async-mutex'
 import { GetUserOpHashes__factory } from '../types'
-import { UserOperation, StorageMap, getAddr, mergeStorageMap, runContractScript } from '@account-abstraction/utils'
+import { StorageMap } from './Types'
+import { getAddr, mergeStorageMap, runContractScript } from './moduleUtils'
 import { EventsManager } from './EventsManager'
-import { ErrorDescription } from '@ethersproject/abi/lib/interface'
+import { toLowerAddr } from '@account-abstraction/utils'
+import { getProviderSendFunction } from '../utils'
+import assert from 'assert'
 
 const debug = Debug('aa.exec.cron')
-
-const THROTTLED_ENTITY_BUNDLE_COUNT = 4
 
 export interface SendBundleReturn {
   transactionHash: string
@@ -21,9 +28,10 @@ export interface SendBundleReturn {
 }
 
 export class BundleManager {
-  provider: JsonRpcProvider
-  signer: JsonRpcSigner
-  mutex = new Mutex()
+  readonly provider: Provider
+  readonly providerSendFunc: (method: string, params: any[]) => Promise<any>
+  readonly signer: Signer
+  readonly mutex = new Mutex()
 
   constructor (
     readonly entryPoint: EntryPoint,
@@ -39,8 +47,10 @@ export class BundleManager {
     // in conditionalRpc: always put root hash (not specific storage slots) for "sender" entries
     readonly mergeToAccountRootHash: boolean = false
   ) {
-    this.provider = entryPoint.provider as JsonRpcProvider
-    this.signer = entryPoint.signer as JsonRpcSigner
+    this.signer = entryPoint.runner as Signer
+    assert(this.signer.provider != null)
+    this.provider = this.signer.provider
+    this.providerSendFunc = getProviderSendFunction(this.provider)
   }
 
   /**
@@ -79,29 +89,28 @@ export class BundleManager {
   async sendBundle (userOps: UserOperation[], beneficiary: string, storageMap: StorageMap): Promise<SendBundleReturn | undefined> {
     try {
       const feeData = await this.provider.getFeeData()
-      const tx = await this.entryPoint.populateTransaction.handleOps(userOps, beneficiary, {
+      const tx = await this.entryPoint.handleOps.populateTransaction(userOps, beneficiary, {
         type: 2,
-        nonce: await this.signer.getTransactionCount(),
-        gasLimit: 10e6,
+        nonce: await this.signer.getNonce(),
+        gasLimit: getBigInt(10e6),
         maxPriorityFeePerGas: feeData.maxPriorityFeePerGas ?? 0,
         maxFeePerGas: feeData.maxFeePerGas ?? 0
       })
-      tx.chainId = this.provider._network.chainId
+      tx.chainId = await this.provider.getNetwork().then(net => net.chainId)
       const signedTx = await this.signer.signTransaction(tx)
       let ret: string
       if (this.conditionalRpc) {
         debug('eth_sendRawTransactionConditional', storageMap)
-        ret = await this.provider.send('eth_sendRawTransactionConditional', [
+        ret = await this.providerSendFunc('eth_sendRawTransactionConditional', [
           signedTx, { knownAccounts: storageMap }
         ])
         debug('eth_sendRawTransactionConditional ret=', ret)
       } else {
         // ret = await this.signer.sendTransaction(tx)
-        ret = await this.provider.send('eth_sendRawTransaction', [signedTx])
+        ret = await this.providerSendFunc('eth_sendRawTransaction', [signedTx])
         debug('eth_sendRawTransaction ret=', ret)
       }
       // TODO: parse ret, and revert if needed.
-      debug('ret=', ret)
       debug('sent handleOps with', userOps.length, 'ops. removing from mempool')
       // hashes are needed for debug rpc only.
       const hashes = await this.getUserOpHashes(userOps)
@@ -110,7 +119,7 @@ export class BundleManager {
         userOpHashes: hashes
       }
     } catch (e: any) {
-      let parsedError: ErrorDescription
+      let parsedError: ErrorDescription | null
       try {
         parsedError = this.entryPoint.interface.parseError((e.data?.data ?? e.data))
       } catch (e1) {
@@ -121,7 +130,7 @@ export class BundleManager {
       const {
         opIndex,
         reason
-      } = parsedError.args
+      } = parsedError?.args ?? {} as any
       const userOp = userOps[opIndex]
       const reasonStr: string = reason.toString()
       if (reasonStr.startsWith('AA3')) {
@@ -132,7 +141,7 @@ export class BundleManager {
         this.reputationManager.crashedHandleOps(getAddr(userOp.initCode))
       } else {
         this.mempoolManager.removeUserOp(userOp)
-        console.warn(`Failed handleOps sender=${userOp.sender} reason=${reasonStr}`)
+        console.warn(`Failed handleOps sender=${toLowerAddr(userOp.sender)} reason=${reasonStr}`)
       }
     }
   }
@@ -150,17 +159,19 @@ export class BundleManager {
     const bundle: UserOperation[] = []
 
     // paymaster deposit should be enough for all UserOps in the bundle.
-    const paymasterDeposit: { [paymaster: string]: BigNumber } = {}
+    const paymasterDeposit: { [paymaster: string]: bigint } = {}
     // throttled paymasters and deployers are allowed only small UserOps per bundle.
     const stakedEntityCount: { [addr: string]: number } = {}
     // each sender is allowed only once per bundle
-    const senders = new Set<string>()
+    const senders = new Set<AddressLike>()
 
     // all entities that are known to be valid senders in the mempool
-    const knownSenders = this.mempoolManager.getKnownSenders()
+    const knownSenders = entries.map(it => {
+      return toLowerAddr(it.userOp.sender)
+    })
 
     const storageMap: StorageMap = {}
-    let totalGas = BigNumber.from(0)
+    let totalGas = 0n
     debug('got mempool of ', entries.length)
     // eslint-disable-next-line no-labels
     mainLoop:
@@ -173,13 +184,11 @@ export class BundleManager {
         this.mempoolManager.removeUserOp(entry.userOp)
         continue
       }
-      // [SREP-030]
-      if (paymaster != null && (paymasterStatus === ReputationStatus.THROTTLED ?? (stakedEntityCount[paymaster] ?? 0) > THROTTLED_ENTITY_BUNDLE_COUNT)) {
+      if (paymaster != null && (paymasterStatus === ReputationStatus.THROTTLED ?? (stakedEntityCount[paymaster] ?? 0) > 1)) {
         debug('skipping throttled paymaster', entry.userOp.sender, entry.userOp.nonce)
         continue
       }
-      // [SREP-030]
-      if (factory != null && (deployerStatus === ReputationStatus.THROTTLED ?? (stakedEntityCount[factory] ?? 0) > THROTTLED_ENTITY_BUNDLE_COUNT)) {
+      if (factory != null && (deployerStatus === ReputationStatus.THROTTLED ?? (stakedEntityCount[factory] ?? 0) > 1)) {
         debug('skipping throttled factory', entry.userOp.sender, entry.userOp.nonce)
         continue
       }
@@ -201,7 +210,7 @@ export class BundleManager {
 
       for (const storageAddress of Object.keys(validationResult.storageMap)) {
         if (
-          storageAddress.toLowerCase() !== entry.userOp.sender.toLowerCase() &&
+          storageAddress.toLowerCase() !== toLowerAddr(entry.userOp.sender).toLowerCase() &&
           knownSenders.includes(storageAddress.toLowerCase())
         ) {
           console.debug(`UserOperation from ${entry.userOp.sender} sender accessed a storage of another known sender ${storageAddress}`)
@@ -213,23 +222,23 @@ export class BundleManager {
       // todo: we take UserOp's callGasLimit, even though it will probably require less (but we don't
       // attempt to estimate it to check)
       // which means we could "cram" more UserOps into a bundle.
-      const userOpGasCost = BigNumber.from(validationResult.returnInfo.preOpGas).add(entry.userOp.callGasLimit)
-      const newTotalGas = totalGas.add(userOpGasCost)
-      if (newTotalGas.gt(this.maxBundleGas)) {
-        break
+      const userOpGasCost = getBigInt(validationResult.returnInfo.preOpGas) + getBigInt(entry.userOp.callGasLimit)
+      const newTotalGas = totalGas + userOpGasCost
+      if (newTotalGas > this.maxBundleGas) {
+        // break
       }
 
       if (paymaster != null) {
         if (paymasterDeposit[paymaster] == null) {
           paymasterDeposit[paymaster] = await this.entryPoint.balanceOf(paymaster)
         }
-        if (paymasterDeposit[paymaster].lt(validationResult.returnInfo.prefund)) {
+        if (paymasterDeposit[paymaster] < validationResult.returnInfo.prefund) {
           // not enough balance in paymaster to pay for all UserOps
           // (but it passed validation, so it can sponsor them separately
           continue
         }
         stakedEntityCount[paymaster] = (stakedEntityCount[paymaster] ?? 0) + 1
-        paymasterDeposit[paymaster] = paymasterDeposit[paymaster].sub(validationResult.returnInfo.prefund)
+        paymasterDeposit[paymaster] = paymasterDeposit[paymaster] - getBigInt(validationResult.returnInfo.prefund)
       }
       if (factory != null) {
         stakedEntityCount[factory] = (stakedEntityCount[factory] ?? 0) + 1
@@ -237,8 +246,8 @@ export class BundleManager {
 
       // If sender's account already exist: replace with its storage root hash
       if (this.mergeToAccountRootHash && this.conditionalRpc && entry.userOp.initCode.length <= 2) {
-        const { storageHash } = await this.provider.send('eth_getProof', [entry.userOp.sender, [], 'latest'])
-        storageMap[entry.userOp.sender.toLowerCase()] = storageHash
+        const { storageHash } = await this.providerSendFunc('eth_getProof', [entry.userOp.sender, [], 'latest'])
+        storageMap[toLowerAddr(entry.userOp.sender).toLowerCase()] = storageHash
       }
       mergeStorageMap(storageMap, validationResult.storageMap)
 
@@ -254,10 +263,10 @@ export class BundleManager {
    * if signer's balance is too low, send it to signer. otherwise, send to configured beneficiary.
    */
   async _selectBeneficiary (): Promise<string> {
-    const currentBalance = await this.provider.getBalance(this.signer.getAddress())
+    const currentBalance = await this.provider.getBalance(await this.signer.getAddress())
     let beneficiary = this.beneficiary
     // below min-balance redeem to the signer, to keep it active.
-    if (currentBalance.lte(this.minSignerBalance)) {
+    if (currentBalance <= getBigInt(this.minSignerBalance)) {
       beneficiary = await this.signer.getAddress()
       console.log('low balance. using ', beneficiary, 'as beneficiary instead of ', this.beneficiary)
     }
@@ -266,9 +275,9 @@ export class BundleManager {
 
   // helper function to get hashes of all UserOps
   async getUserOpHashes (userOps: UserOperation[]): Promise<string[]> {
-    const { userOpHashes } = await runContractScript(this.entryPoint.provider,
+    const { userOpHashes } = await runContractScript(this.provider,
       new GetUserOpHashes__factory(),
-      [this.entryPoint.address, userOps])
+      [await this.entryPoint.getAddress(), userOps])
 
     return userOpHashes
   }

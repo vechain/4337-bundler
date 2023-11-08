@@ -1,12 +1,10 @@
-import { BigNumber, BigNumberish } from 'ethers'
+import { BigNumberish, concat, getBigInt, getBytes, Signer } from 'ethers'
 import {
   SimpleAccount,
   SimpleAccount__factory, SimpleAccountFactory,
   SimpleAccountFactory__factory
-} from '@account-abstraction/contracts'
+} from '@account-abstraction/contract-types'
 
-import { arrayify, hexConcat } from 'ethers/lib/utils'
-import { Signer } from '@ethersproject/abstract-signer'
 import { BaseApiParams, BaseAccountAPI } from './BaseAccountAPI'
 
 /**
@@ -46,7 +44,7 @@ export class SimpleAccountAPI extends BaseAccountAPI {
     super(params)
     this.factoryAddress = params.factoryAddress
     this.owner = params.owner
-    this.index = BigNumber.from(params.index ?? 0)
+    this.index = getBigInt(params.index ?? 0)
   }
 
   async _getAccountContract (): Promise<SimpleAccount> {
@@ -68,15 +66,15 @@ export class SimpleAccountAPI extends BaseAccountAPI {
         throw new Error('no factory to get initCode')
       }
     }
-    return hexConcat([
-      this.factory.address,
+    return concat([
+      this.factoryAddress ?? '',
       this.factory.interface.encodeFunctionData('createAccount', [await this.owner.getAddress(), this.index])
     ])
   }
 
-  async getNonce (): Promise<BigNumber> {
+  async getNonce (): Promise<bigint> {
     if (await this.checkAccountPhantom()) {
-      return BigNumber.from(0)
+      return getBigInt(0)
     }
     const accountContract = await this._getAccountContract()
     return await accountContract.getNonce()
@@ -100,6 +98,6 @@ export class SimpleAccountAPI extends BaseAccountAPI {
   }
 
   async signUserOpHash (userOpHash: string): Promise<string> {
-    return await this.owner.signMessage(arrayify(userOpHash))
+    return await this.owner.signMessage(getBytes(userOpHash))
   }
 }

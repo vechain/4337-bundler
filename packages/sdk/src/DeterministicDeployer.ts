@@ -1,8 +1,13 @@
-import { BigNumber, BigNumberish, ContractFactory } from 'ethers'
-import { hexConcat, hexlify, hexZeroPad, keccak256 } from 'ethers/lib/utils'
-import { TransactionRequest } from '@ethersproject/abstract-provider'
-import { JsonRpcProvider, JsonRpcSigner } from '@ethersproject/providers'
-import { Signer } from '@ethersproject/abstract-signer'
+import {
+  BigNumberish, concat,
+  ContractFactory,
+  getBigInt,
+  hexlify,
+  JsonRpcProvider,
+  keccak256, Provider,
+  Signer, toBeHex,
+  TransactionRequest
+} from 'ethers'
 
 /**
  * wrapper class for Arachnid's deterministic deployer
@@ -14,11 +19,11 @@ export class DeterministicDeployer {
    * @param ctrCode constructor code to pass to CREATE2, or ContractFactory
    * @param salt optional salt. defaults to zero
    */
-  static getAddress (ctrCode: string, salt: BigNumberish): string
-  static getAddress (ctrCode: string): string
-  static getAddress (ctrCode: ContractFactory, salt: BigNumberish, params: any[]): string
-  static getAddress (ctrCode: string | ContractFactory, salt: BigNumberish = 0, params: any[] = []): string {
-    return DeterministicDeployer.getDeterministicDeployAddress(ctrCode, salt, params)
+  static async getAddress (ctrCode: string, salt: BigNumberish): Promise<string>
+  static async getAddress (ctrCode: string): Promise<string>
+  static async getAddress (ctrCode: ContractFactory, salt: BigNumberish, params: any[]): Promise<string>
+  static async getAddress (ctrCode: string | ContractFactory, salt: BigNumberish = 0, params: any[] = []): Promise<string> {
+    return await DeterministicDeployer.getDeterministicDeployAddress(ctrCode, salt, params)
   }
 
   /**
@@ -42,8 +47,15 @@ export class DeterministicDeployer {
   static deploymentGasLimit = 100000
 
   constructor (
-    readonly provider: JsonRpcProvider,
-    readonly signer?: Signer) {
+    readonly provider: Provider,
+    private _signer?: Signer) {
+  }
+
+  async getSigner (): Promise<Signer> {
+    if (this._signer == null) {
+      this._signer = await (this.provider as JsonRpcProvider).getSigner()
+    }
+    return this._signer
   }
 
   async isContractDeployed (address: string): Promise<boolean> {
@@ -59,16 +71,17 @@ export class DeterministicDeployer {
       return
     }
     const bal = await this.provider.getBalance(DeterministicDeployer.deploymentSignerAddress)
-    const neededBalance = BigNumber.from(DeterministicDeployer.deploymentGasLimit).mul(DeterministicDeployer.deploymentGasPrice)
-    if (bal.lt(neededBalance)) {
-      const signer = this.signer ?? this.provider.getSigner()
+    const neededBalance = getBigInt(DeterministicDeployer.deploymentGasLimit) * getBigInt(DeterministicDeployer.deploymentGasPrice)
+    if (bal < neededBalance) {
+      const signer = await this.getSigner()
       await signer.sendTransaction({
         to: DeterministicDeployer.deploymentSignerAddress,
         value: neededBalance,
         gasLimit: DeterministicDeployer.deploymentGasLimit
-      })
+      }).then(async ret => await ret.wait())
     }
-    await this.provider.send('eth_sendRawTransaction', [DeterministicDeployer.deploymentTransaction])
+
+    await this.provider.broadcastTransaction(DeterministicDeployer.deploymentTransaction).then(async ret => await ret.wait())
     if (!await this.isContractDeployed(DeterministicDeployer.proxyAddress)) {
       throw new Error('raw TX didn\'t deploy deployer!')
     }
@@ -76,20 +89,19 @@ export class DeterministicDeployer {
 
   async getDeployTransaction (ctrCode: string | ContractFactory, salt: BigNumberish = 0, params: any[] = []): Promise<TransactionRequest> {
     await this.deployFactory()
-    const saltEncoded = hexZeroPad(hexlify(salt), 32)
-    const ctrEncoded = DeterministicDeployer.getCtrCode(ctrCode, params)
+    const saltEncoded = toBeHex(salt, 32)
+    const ctrEncoded = await DeterministicDeployer.getCtrCode(ctrCode, params)
     return {
       to: DeterministicDeployer.proxyAddress,
-      data: hexConcat([
+      data: concat([
         saltEncoded,
         ctrEncoded])
     }
   }
 
-  static getCtrCode (ctrCode: string | ContractFactory, params: any[]): string {
+  static async getCtrCode (ctrCode: string | ContractFactory, params: any[]): Promise<string> {
     if (typeof ctrCode !== 'string') {
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-      return hexlify(ctrCode.getDeployTransaction(...params).data!)
+      return hexlify(await ctrCode.getDeployTransaction(...params).then(x => x.data))
     } else {
       if (params.length !== 0) {
         throw new Error('constructor params can only be passed to ContractFactory')
@@ -98,13 +110,13 @@ export class DeterministicDeployer {
     }
   }
 
-  static getDeterministicDeployAddress (ctrCode: string | ContractFactory, salt: BigNumberish = 0, params: any[] = []): string {
+  static async getDeterministicDeployAddress (ctrCode: string | ContractFactory, salt: BigNumberish = 0, params: any[] = []): Promise<string> {
     // this method works only before the contract is already deployed:
     // return await this.provider.call(await this.getDeployTransaction(ctrCode, salt))
-    const saltEncoded = hexZeroPad(hexlify(salt), 32)
+    const saltEncoded = toBeHex(salt, 32)
 
-    const ctrCode1 = DeterministicDeployer.getCtrCode(ctrCode, params)
-    return '0x' + keccak256(hexConcat([
+    const ctrCode1 = await DeterministicDeployer.getCtrCode(ctrCode, params)
+    return '0x' + keccak256(concat([
       '0xff',
       DeterministicDeployer.proxyAddress,
       saltEncoded,
@@ -113,18 +125,18 @@ export class DeterministicDeployer {
   }
 
   async deterministicDeploy (ctrCode: string | ContractFactory, salt: BigNumberish = 0, params: any[] = []): Promise<string> {
-    const addr = DeterministicDeployer.getDeterministicDeployAddress(ctrCode, salt, params)
+    const addr = await DeterministicDeployer.getDeterministicDeployAddress(ctrCode, salt, params)
     if (!await this.isContractDeployed(addr)) {
-      const signer = this.signer ?? this.provider.getSigner()
+      const signer = await this.getSigner()
       await signer.sendTransaction(
-        await this.getDeployTransaction(ctrCode, salt, params))
+        await this.getDeployTransaction(ctrCode, salt, params)).then(async ret => await ret.wait())
     }
     return addr
   }
 
   private static _instance?: DeterministicDeployer
 
-  static init (provider: JsonRpcProvider, signer?: JsonRpcSigner): void {
+  static init (provider: Provider, signer?: Signer): void {
     this._instance = new DeterministicDeployer(provider, signer)
   }
 

@@ -1,15 +1,23 @@
-import { Deferrable, defineReadOnly } from '@ethersproject/properties'
-import { Provider, TransactionRequest, TransactionResponse } from '@ethersproject/providers'
-import { Signer } from '@ethersproject/abstract-signer'
-
-import { Bytes } from 'ethers'
 import { ERC4337EthersProvider } from './ERC4337EthersProvider'
 import { ClientConfig } from './ClientConfig'
 import { HttpRpcClient } from './HttpRpcClient'
-import { UserOperationStruct } from '@account-abstraction/contracts'
+import {
+  UserOperationStruct
+} from '@account-abstraction/contract-types'
 import { BaseAccountAPI } from './BaseAccountAPI'
+import {
+  AbstractSigner,
+  Provider,
+  Signer,
+  TransactionRequest,
+  TransactionResponse,
+  TypedDataDomain, TypedDataField
+} from 'ethers'
+import { BlockTag } from 'ethers/src.ts/providers/provider'
 
-export class ERC4337EthersSigner extends Signer {
+export class ERC4337EthersSigner extends AbstractSigner {
+  private address?: string
+
   // TODO: we have 'erc4337provider', remove shared dependencies or avoid two-way reference
   constructor (
     readonly config: ClientConfig,
@@ -17,21 +25,23 @@ export class ERC4337EthersSigner extends Signer {
     readonly erc4337provider: ERC4337EthersProvider,
     readonly httpRpcClient: HttpRpcClient,
     readonly smartAccountAPI: BaseAccountAPI) {
-    super()
-    defineReadOnly(this, 'provider', erc4337provider)
+    super(erc4337provider)
+
+    // wtf: I think provider no longer means what we think it means: it is JsonRpcAPIProvider, not a real provider...
+    // anyway, defineReadOnly is not found anymore..
+    // defineReadOnly(this, 'provider', erc4337provider)
   }
 
-  address?: string
-
   // This one is called by Contract. It signs the request and passes in to Provider to be sent.
-  async sendTransaction (transaction: Deferrable<TransactionRequest>): Promise<TransactionResponse> {
+  async sendTransaction (transaction: TransactionRequest): Promise<TransactionResponse> {
     const tx: TransactionRequest = await this.populateTransaction(transaction)
     await this.verifyAllNecessaryFields(tx)
+    // IDE requires "!" to mark non-null, but eslint rejects it. both are happy with "?? ''"
     const userOperation = await this.smartAccountAPI.createSignedUserOp({
       target: tx.to ?? '',
       data: tx.data?.toString() ?? '',
-      value: tx.value,
-      gasLimit: tx.gasLimit
+      value: tx.value ?? 0n,
+      gasLimit: tx.gasLimit ?? 0n
     })
     const transactionResponse = await this.erc4337provider.constructUserOpTransactionResponse(userOperation)
     try {
@@ -42,6 +52,16 @@ export class ERC4337EthersSigner extends Signer {
     }
     // TODO: handle errors - transaction that is "rejected" by bundler is _not likely_ to ever resolve its "wait()"
     return transactionResponse
+  }
+
+  async signTypedData (domain: TypedDataDomain, types: Record<string, TypedDataField[]>, value: Record<string, any>): Promise<string> {
+    throw new Error('not implemented')
+  }
+
+  async getNonce (blockTag?: BlockTag): Promise<number> {
+    const nonce = this.smartAccountAPI.getNonce()
+    // TODO: getNonce's API return a "number". we can't fit this range. assume caller can handle bitint..
+    return nonce as any
   }
 
   unwrapError (errorIn: any): Error {
@@ -75,7 +95,7 @@ export class ERC4337EthersSigner extends Signer {
     }
   }
 
-  connect (provider: Provider): Signer {
+  connect (provider: null | Provider): Signer {
     throw new Error('changing providers is not supported')
   }
 
@@ -86,11 +106,11 @@ export class ERC4337EthersSigner extends Signer {
     return this.address
   }
 
-  async signMessage (message: Bytes | string): Promise<string> {
+  async signMessage (message: string | Uint8Array): Promise<string> {
     return await this.originalSigner.signMessage(message)
   }
 
-  async signTransaction (transaction: Deferrable<TransactionRequest>): Promise<string> {
+  async signTransaction (transaction: TransactionRequest): Promise<string> {
     throw new Error('not implemented')
   }
 

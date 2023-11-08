@@ -2,39 +2,43 @@ import { DebugMethodHandler } from '../src/DebugMethodHandler'
 import { ExecutionManager } from '../src/modules/ExecutionManager'
 import { BundlerReputationParams, ReputationManager } from '../src/modules/ReputationManager'
 import { BundlerConfig } from '../src/BundlerConfig'
-import { parseEther } from 'ethers/lib/utils'
+import { supportsDebugTraceCall } from '../src/utils'
+import { parseEther, Signer, Wallet } from 'ethers'
 import { MempoolManager } from '../src/modules/MempoolManager'
-import { ValidationManager, supportsDebugTraceCall } from '@account-abstraction/validation-manager'
+import { ValidationManager } from '../src/modules/ValidationManager'
 import { BundleManager, SendBundleReturn } from '../src/modules/BundleManager'
 import { UserOpMethodHandler } from '../src/UserOpMethodHandler'
-import { ethers } from 'hardhat'
-import { EntryPoint, EntryPoint__factory, SimpleAccountFactory__factory } from '@account-abstraction/contracts'
+import {
+  EntryPoint,
+  EntryPoint__factory,
+  SimpleAccountFactory__factory
+} from '@account-abstraction/contract-types'
 import { DeterministicDeployer, SimpleAccountAPI } from '@account-abstraction/sdk'
-import { Signer, Wallet } from 'ethers'
 import { resolveHexlify } from '@account-abstraction/utils'
 import { expect } from 'chai'
-import { createSigner } from './testUtils'
+import { provider, createSigner } from './testUtils'
 import { EventsManager } from '../src/modules/EventsManager'
-
-const provider = ethers.provider
 
 describe('#DebugMethodHandler', () => {
   let debugMethodHandler: DebugMethodHandler
   let entryPoint: EntryPoint
+  let entryPointAddress: string
   let methodHandler: UserOpMethodHandler
   let smartAccountAPI: SimpleAccountAPI
   let signer: Signer
   const accountSigner = Wallet.createRandom()
 
-  before(async () => {
+  before(async function () {
+    this.timeout(10000)
     signer = await createSigner()
 
     entryPoint = await new EntryPoint__factory(signer).deploy()
+    entryPointAddress = await entryPoint.getAddress()
     DeterministicDeployer.init(provider)
 
     const config: BundlerConfig = {
       beneficiary: await signer.getAddress(),
-      entryPoint: entryPoint.address,
+      entryPoint: entryPointAddress,
       gasFactor: '0.2',
       minBalance: '0',
       mnemonic: '',
@@ -50,7 +54,7 @@ describe('#DebugMethodHandler', () => {
       minUnstakeDelay: 0
     }
 
-    const repMgr = new ReputationManager(provider, BundlerReputationParams, parseEther(config.minStake), config.minUnstakeDelay)
+    const repMgr = new ReputationManager(BundlerReputationParams, parseEther(config.minStake), config.minUnstakeDelay)
     const mempoolMgr = new MempoolManager(repMgr)
     const validMgr = new ValidationManager(entryPoint, repMgr, config.unsafe)
     const eventsManager = new EventsManager(entryPoint, mempoolMgr, repMgr)
@@ -67,12 +71,11 @@ describe('#DebugMethodHandler', () => {
 
     debugMethodHandler = new DebugMethodHandler(execManager, eventsManager, repMgr, mempoolMgr)
 
-    DeterministicDeployer.init(ethers.provider)
-    const accountDeployerAddress = await DeterministicDeployer.deploy(new SimpleAccountFactory__factory(), 0, [entryPoint.address])
+    const accountDeployerAddress = await DeterministicDeployer.deploy(new SimpleAccountFactory__factory(), 0, [entryPointAddress])
 
     smartAccountAPI = new SimpleAccountAPI({
       provider,
-      entryPointAddress: entryPoint.address,
+      entryPointAddress,
       owner: accountSigner,
       factoryAddress: accountDeployerAddress
     })
@@ -90,13 +93,13 @@ describe('#DebugMethodHandler', () => {
       target: addr,
       data: '0x'
     })
-    const userOpHash = await methodHandler.sendUserOperation(await resolveHexlify(op1), entryPoint.address)
+    const userOpHash = await methodHandler.sendUserOperation(await resolveHexlify(op1), entryPointAddress)
     const {
       transactionHash,
       userOpHashes
     } = await debugMethodHandler.sendBundleNow() as SendBundleReturn
     expect(userOpHashes).eql([userOpHash])
     const txRcpt = await provider.getTransactionReceipt(transactionHash)
-    expect(txRcpt.to).to.eq(entryPoint.address)
+    expect(txRcpt?.to).to.eq(entryPointAddress)
   })
 })

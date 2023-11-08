@@ -1,5 +1,4 @@
 import { expect } from 'chai'
-import { BigNumber } from 'ethers'
 import { deepHexlify } from '@account-abstraction/utils'
 
 describe('#deepHexlify', function () {
@@ -7,7 +6,7 @@ describe('#deepHexlify', function () {
     expect(deepHexlify({})).to.eql({})
   })
   it('flat', () => {
-    expect(deepHexlify({ a: 1 })).to.eql({ a: '0x1' })
+    expect(deepHexlify({ a: 1n })).to.eql({ a: '0x1' })
   })
   it('no-modify for strings', () => {
     expect(deepHexlify({ a: 'hello' })).to.eql({ a: 'hello' })
@@ -15,8 +14,8 @@ describe('#deepHexlify', function () {
   it('no-modify for boolean', () => {
     expect(deepHexlify({ a: false })).to.eql({ a: false })
   })
-  it('bignum', () => {
-    expect(deepHexlify({ a: BigNumber.from(3) })).to.eql({ a: '0x3' })
+  it('bigint', () => {
+    expect(deepHexlify({ a: 3n })).to.eql({ a: '0x3' })
   })
   it('deep object ', () => {
     expect(deepHexlify({

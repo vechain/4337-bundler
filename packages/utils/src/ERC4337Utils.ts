@@ -1,24 +1,21 @@
-import { defaultAbiCoder, hexConcat, hexlify, keccak256, resolveProperties } from 'ethers/lib/utils'
-import { UserOperationStruct } from '@account-abstraction/contracts'
-import { abi as entryPointAbi } from '@account-abstraction/contracts/artifacts/IEntryPoint.json'
-import { ethers } from 'ethers'
+import {
+  AbiCoder,
+  AddressLike,
+  concat,
+  ethers,
+  hexlify,
+  keccak256,
+  resolveProperties,
+  toQuantity
+} from 'ethers'
 import Debug from 'debug'
+import { EntryPoint, UserOperation } from '@account-abstraction/contract-types'
 
 const debug = Debug('aa.utils')
 
-// UserOperation is the first parameter of validateUseOp
-const validateUserOpMethod = 'simulateValidation'
-const UserOpType = entryPointAbi.find(entry => entry.name === validateUserOpMethod)?.inputs[0]
-if (UserOpType == null) {
-  throw new Error(`unable to find method ${validateUserOpMethod} in EP ${entryPointAbi.filter(x => x.type === 'function').map(x => x.name).join(',')}`)
-}
+const defaultAbiCoder = AbiCoder.defaultAbiCoder()
 
-export const AddressZero = ethers.constants.AddressZero
-
-// reverse "Deferrable" or "PromiseOrValue" fields
-export type NotPromise<T> = {
-  [P in keyof T]: Exclude<T[P], Promise<any>>
-}
+export const AddressZero = ethers.ZeroAddress
 
 /**
  * pack the userOperation
@@ -26,7 +23,7 @@ export type NotPromise<T> = {
  * @param forSignature "true" if the hash is needed to calculate the getUserOpHash()
  *  "false" to pack entire UserOp, for calculating the calldata cost of putting it on-chain.
  */
-export function packUserOp (op: NotPromise<UserOperationStruct>, forSignature = true): string {
+export function packUserOp (op: UserOperation, forSignature = true): string {
   if (forSignature) {
     return defaultAbiCoder.encode(
       ['address', 'uint256', 'bytes32', 'bytes32',
@@ -56,7 +53,7 @@ export function packUserOp (op: NotPromise<UserOperationStruct>, forSignature = 
  * @param entryPoint
  * @param chainId
  */
-export function getUserOpHash (op: NotPromise<UserOperationStruct>, entryPoint: string, chainId: number): string {
+export function getUserOpHash (op: UserOperation, entryPoint: string, chainId: number): string {
   const userOpHash = keccak256(packUserOp(op, true))
   const enc = defaultAbiCoder.encode(
     ['bytes32', 'address', 'uint256'],
@@ -112,7 +109,7 @@ export function rethrowError (e: any): any {
 
     if (decoded.opIndex != null) {
       // helper for chai: convert our FailedOp error into "Error(msg)"
-      const errorWithMsg = hexConcat([ErrorSig, defaultAbiCoder.encode(['string'], [decoded.message])])
+      const errorWithMsg = concat([ErrorSig, defaultAbiCoder.encode(['string'], [decoded.message])])
       // modify in-place the error object:
       parent.data = errorWithMsg
     }
@@ -128,9 +125,13 @@ export function deepHexlify (obj: any): any {
   if (typeof obj === 'function') {
     return undefined
   }
+  if (typeof obj === 'number' || typeof obj === 'bigint') {
+    return toQuantity(obj)
+  }
   if (obj == null || typeof obj === 'string' || typeof obj === 'boolean') {
     return obj
-  } else if (obj._isBigNumber != null || typeof obj !== 'object') {
+  }
+  if (obj._isBigNumber != null || typeof obj !== 'object') {
     return hexlify(obj).replace(/^0x0/, '0x')
   }
   if (Array.isArray(obj)) {
@@ -143,8 +144,28 @@ export function deepHexlify (obj: any): any {
     }), {})
 }
 
+export function parseEntryPointError (error: any, entryPoint: EntryPoint): any {
+  if (error != null && error.errorName == null && error.data != null) {
+    // wtf: why should I parse the error?
+    const ret = entryPoint.interface.parseError(error.data.data ?? error.data)
+    error = {
+      errorName: ret?.name,
+      errorArgs: ret?.args
+    }
+  }
+  return error
+}
+
 // resolve all property and hexlify.
 // (UserOpMethodHandler receives data from the network, so we need to pack our generated values)
 export async function resolveHexlify (a: any): Promise<any> {
   return deepHexlify(await resolveProperties(a))
+}
+
+export function toLowerAddr (addr: AddressLike): string {
+  if (typeof addr !== 'string') {
+    // AddressLike supports "resolvable", which we don't use.
+    throw new Error('unsupported address type')
+  }
+  return addr.toLowerCase()
 }
